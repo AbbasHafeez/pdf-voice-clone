@@ -1,112 +1,172 @@
-# Silence noisy platform warnings (optional)
+# --- stability & noise control (set BEFORE importing streamlit) ---
+import os
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "poll")  # safer on Windows/OneDrive
+os.environ.setdefault("STREAMLIT_LOG_LEVEL", "error")                # quieter logs
+
 import warnings
-warnings.filterwarnings("ignore", message="Torchaudio's I/O functions now support")
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Torchaudio's I/O functions now support .*backend dispatch.*",
+    category=UserWarning,
+)
+# ------------------------------------------------------------------
 
 import tempfile
 from pathlib import Path
 import streamlit as st
-from pypdf import PdfReader
-import pdf_to_voice_clone_short as tts  # our backend module
+import fitz  # PyMuPDF
 
-# Must be the first Streamlit call
-st.set_page_config(page_title="PDF → Audiobook (Your Voice)", page_icon="🎧", layout="centered")
-st.title("🎧 PDF → Audiobook in Your Voice")
-st.caption("Upload a PDF and a short voice sample. XTTS v2 will clone your voice and narrate the selected pages.")
+from pdf_to_voice_clone_short import (
+    convert_pdf_to_cloned_audiobook,
+    get_pdf_meta,
+    have_ffmpeg,
+)
 
-# Stable per-session workspace (prevents media-file races on reruns)
-if "workdir" not in st.session_state:
-    st.session_state.workdir = Path(tempfile.mkdtemp(prefix="audiobook_"))
+st.set_page_config(page_title="PDF → Cloned Audiobook (XTTS-v2)", page_icon="🎧", layout="centered")
 
-pdf   = st.file_uploader("PDF", type=["pdf"])
-voice = st.file_uploader("Your voice (mp3/mp4/wav/m4a/aac/flac/ogg)", type=["mp3","mp4","wav","m4a","aac","flac","ogg"])
+st.markdown(
+    """
+    <div style="text-align:center">
+      <h1 style="margin-bottom:0">📚 → 🎧 Cloned Audiobook</h1>
+      <p style="margin-top:4px;color:#888">XTTS-v2 (multilingual, voice cloning). Clean sequential pipeline.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Discover page count for defaults
-total = None
-if pdf:
+with st.container():
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        pdf_file = st.file_uploader("PDF file", type=["pdf"], help="Upload the document to narrate")
+    with c2:
+        ref_file = st.file_uploader(
+            "Reference voice (optional)",
+            type=["wav", "mp3", "m4a", "mp4", "ogg", "flac", "aac"],
+            help="Short voice sample to clone. WAV works even without FFmpeg."
+        )
+
+# Show PDF metadata if uploaded
+pdf_path = None
+page_count = None
+title = ""
+if pdf_file:
+    tmp_dir = Path(tempfile.gettempdir()) / "pdf2voice_streamlit"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = tmp_dir / ("in_" + pdf_file.name)
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_file.read())
     try:
-        r = PdfReader(pdf); total = len(r.pages)
-        st.caption(f"Detected {total} pages (0-based).")
-    except Exception as e:
-        st.warning(f"Could not read page count: {e}")
-    finally:
-        pdf.seek(0)
+        page_count, title = get_pdf_meta(pdf_path)
+    except Exception:
+        page_count, title = None, ""
 
-c1, c2 = st.columns(2)
+    if page_count:
+        st.info(f"📄 **Pages:** {page_count}" + (f" • **Title:** {title}" if title else ""))
+
+st.divider()
+
+# Scope controls
+scope = st.radio(
+    "Select scope",
+    ["Entire document", "Page range", "First N words"],
+    horizontal=True,
+)
+
+c1, c2, c3 = st.columns(3)
+if scope == "Entire document":
+    start_page = end_page = None
+    word_limit = None
+elif scope == "Page range":
+    default_end = page_count or 1
+    with c1:
+        start_page = st.number_input("Start page (1-based)", min_value=1, value=1, step=1)
+    with c2:
+        end_page = st.number_input("End page (1-based)", min_value=1, value=int(default_end), step=1)
+    word_limit = None
+else:  # First N words
+    with c1:
+        word_limit = st.number_input("N words", min_value=50, value=500, step=50)
+    start_page = end_page = None
+
+# Synthesis settings
+c1, c2, c3 = st.columns(3)
 with c1:
-    a = st.number_input("Start page (inclusive, 0-based)", min_value=0, value=0, step=1)
+    lang = st.text_input("Language code", value="en", help="e.g., en, ur")
 with c2:
-    b = st.number_input("End page (inclusive)", min_value=0, value=(total - 1 if total else 0), step=1)
+    max_chars = st.slider("Max chars per chunk", min_value=120, max_value=600, value=240, step=10)
+with c3:
+    silence_ms = st.slider("Silence between chunks (ms)", min_value=0, max_value=2000, value=300, step=50)
 
-name = st.text_input("Output filename", value="audiobook_in_my_voice.mp3")
-lang = st.selectbox("Language", ["en","de","fr","es","it","pt","ru","zh","ja","ko","ar"], index=0)
+out_name = st.text_input("Output file name (without extension)", value="audiobook")
 
-# Cache the model once per process (warms up on demand)
-@st.cache_resource
-def _warm_tts():
-    return tts.get_tts()
+# Export note
+if not have_ffmpeg():
+    st.warning(
+        "FFmpeg not detected. Export will be **.wav** and non-WAV reference files may not convert. "
+        "Install FFmpeg for MP3 export and broader input support."
+    )
 
-with st.sidebar:
-    if st.button("Preload voice model (faster first run)"):
-        _ = _warm_tts()
-        st.success("Model loaded and cached.")
+# Progress UI
+progress_bar = st.progress(0, text="Waiting…")
+status = st.empty()
 
-go = st.button("Generate", type="primary", use_container_width=True)
+def make_progress_fn():
+    # Backend calls this with (idx, total, message) in sequential order
+    def fn(idx: int, total: int, message: str):
+        pct = int((idx / max(1, total)) * 100)
+        progress_bar.progress(pct, text=f"{message} ({idx}/{total})")
+        status.write(f"🗣️ {message}")
+    return fn
+
+go = st.button("Generate 🎧", type="primary", use_container_width=True, disabled=not pdf_file)
 
 if go:
-    if not pdf or not voice:
-        st.error("Upload both a PDF and a voice sample."); st.stop()
+    # Save reference voice if any
+    voice_path = None
+    if ref_file:
+        tmp_dir = Path(tempfile.gettempdir()) / "pdf2voice_streamlit"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        voice_path = tmp_dir / ("ref_" + ref_file.name)
+        with open(voice_path, "wb") as f:
+            f.write(ref_file.read())
 
-    w = st.session_state.workdir
-    pdf_p   = w / "uploaded.pdf"
-    voice_p = w / f"voice{Path(voice.name).suffix or '.wav'}"
-    out_p   = w / (name or "audiobook_in_my_voice.mp3")
+    out_base = Path(tempfile.gettempdir()) / "pdf2voice_streamlit" / out_name  # ext decided automatically
 
-    pdf_p.write_bytes(pdf.read())
-    voice_p.write_bytes(voice.read())
+    progress_fn = make_progress_fn()
 
-    if total is not None:
-        a = int(max(0, min(int(a), total - 1)))
-        b = int(max(int(a), min(int(b), total - 1)))
-    else:
-        a, b = int(a), int(max(a, b))
-
-    # Override backend parameters
-    tts.PDF_PATH   = str(pdf_p)
-    tts.VOICE_REF  = str(voice_p)
-    tts.OUT_FILE   = str(out_p)
-    tts.LANG       = lang
-    tts.START_PAGE = a
-    tts.END_PAGE   = b
-
-    # ensure model is loaded once before generating
-    _ = _warm_tts()
-
-    with st.status("Synthesizing… (first run may be slower; cached afterwards)", expanded=False):
+    with st.spinner("Synthesizing… first model load can take a moment on CPU"):
         try:
-            tts.main()
-        except SystemExit as e:
-            st.error(str(e)); st.stop()
+            final_path = convert_pdf_to_cloned_audiobook(
+                pdf_path=pdf_path,
+                voice_ref_path=voice_path,
+                out_path=out_base,
+                start_page=None if scope != "Page range" else int(start_page),
+                end_page=None if scope != "Page range" else int(end_page),
+                word_limit=None if scope != "First N words" else int(word_limit),
+                lang=lang.strip() or "en",
+                max_chars=int(max_chars),
+                silence_ms=int(silence_ms),
+                progress_fn=progress_fn,
+            )
         except Exception as e:
-            st.error(f"Failed: {e}"); st.stop()
+            progress_bar.progress(0, text="Error")
+            status.empty()
+            st.exception(e)
+            st.stop()
 
-    if out_p.exists():
-        st.session_state.audio_bytes = out_p.read_bytes()
-        st.session_state.audio_name  = out_p.name
-        st.success("Done! Your audiobook is ready.")
-    else:
-        st.error("No output produced.")
+    progress_bar.progress(100, text="Done")
+    status.empty()
 
-# Render from session_state so media survives reruns
-if "audio_bytes" in st.session_state and st.session_state.audio_bytes:
-    data  = st.session_state.audio_bytes
-    fname = st.session_state.get("audio_name", "audiobook.mp3")
-    mime  = "audio/mpeg" if fname.lower().endswith(".mp3") else "audio/wav"
-    st.audio(data, format=("audio/mp3" if mime == "audio/mpeg" else "audio/wav"))
-    st.download_button("Download", data=data, file_name=fname, mime=mime, use_container_width=True)
-
-    with st.expander("Reset"):
-        if st.button("Clear generated audio"):
-            st.session_state.pop("audio_bytes", None)
-            st.session_state.pop("audio_name",  None)
-            st.rerun()
+    # Show download + in-page player
+    st.success("All set! Download or play below.")
+    with open(final_path, "rb") as f:
+        data = f.read()
+        mime = "audio/mpeg" if final_path.suffix.lower() == ".mp3" else "audio/wav"
+        st.download_button(
+            label="⬇️ Download",
+            data=data,
+            file_name=final_path.name,
+            mime=mime,
+            use_container_width=True,
+        )
+        st.audio(data, format=mime)
