@@ -16,11 +16,13 @@ END_PAGE = 0
 MAX_CHARS = 280           # a bit larger => fewer calls => faster
 ADD_SIL_MS = 150          # less padding between chunks => faster overall
 
-# --- NLTK tokenizer (one-time) ---
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt", quiet=True)
+# --- One-time guards for NLTK resources (punkt + punkt_tab) ---
+for resource in ["punkt", "punkt_tab"]:
+    try:
+        nltk.data.find(f"tokenizers/{resource}")
+    except LookupError:
+        nltk.download(resource, quiet=True)
+
 
 # --- Cache the XTTS model globally so Streamlit reruns don't reload it ---
 _TTS = None
