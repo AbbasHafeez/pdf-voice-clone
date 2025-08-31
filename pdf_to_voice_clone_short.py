@@ -4,31 +4,31 @@ from pypdf import PdfReader
 from pydub import AudioSegment
 from TTS.api import TTS
 from nltk.tokenize import sent_tokenize
-import nltk, tempfile, sys
+import nltk, tempfile
 
-# ===== Defaults (Streamlit overrides these) =====
+# ===== Defaults (UI will override these at runtime) =====
 PDF_PATH = "life_3_0.pdf"
 VOICE_REF = "file.mp3"
 OUT_FILE = "audiobook_in_my_voice.mp3"
 LANG = "en"
 START_PAGE = 0
 END_PAGE = 0
-MAX_CHARS = 280           # a bit larger => fewer calls => faster
-ADD_SIL_MS = 150          # less padding between chunks => faster overall
+MAX_CHARS = 280           # larger chunks => fewer TTS calls => faster
+ADD_SIL_MS = 150          # small inter-chunk pause
 
-# --- One-time guards for NLTK resources (punkt + punkt_tab) ---
+# --- Ensure NLTK tokenizers are available on any platform (incl. cloud) ---
 for resource in ["punkt", "punkt_tab"]:
     try:
         nltk.data.find(f"tokenizers/{resource}")
     except LookupError:
         nltk.download(resource, quiet=True)
 
-
-# --- Cache the XTTS model globally so Streamlit reruns don't reload it ---
+# --- Global model cache (process-wide, safe for Streamlit reruns) ---
 _TTS = None
 _DEVICE = "cpu"
 
-def _get_device():
+def _get_device() -> str:
+    """Choose fastest available device; keep CPU threads in check on shared runners."""
     global _DEVICE
     try:
         import torch
@@ -37,13 +37,17 @@ def _get_device():
             torch.set_float32_matmul_precision("high")
         else:
             _DEVICE = "cpu"
-            torch.set_num_threads(max(1, torch.get_num_threads() // 2))
+            # avoid hogging shared CPUs in cloud
+            try:
+                torch.set_num_threads(max(1, torch.get_num_threads() // 2))
+            except Exception:
+                pass
     except Exception:
         _DEVICE = "cpu"
     return _DEVICE
 
 def get_tts():
-    """Load XTTS once per process; reuse for all subsequent calls."""
+    """Load Coqui XTTS v2 once and reuse."""
     global _TTS
     if _TTS is not None:
         return _TTS
@@ -86,7 +90,7 @@ def _chunks(s: str, lim: int) -> List[str]:
     return out
 
 def _norm_ref(src: Path, dst: Path):
-    # mono, 16kHz, 16-bit PCM
+    """Normalize voice reference to mono 16kHz, 16-bit PCM WAV (pydub needs ffmpeg)."""
     AudioSegment.from_file(str(src)).set_frame_rate(16000).set_channels(1).set_sample_width(2).export(dst, format="wav")
 
 def main():
@@ -99,14 +103,13 @@ def main():
 
     work = Path(tempfile.mkdtemp(prefix="xtts_"))
     ref_wav = work / "ref.wav"
-    # If we've already normalized the same file path in this run, reuse it
-    if not ref_wav.exists():
-        _norm_ref(ref, ref_wav)
+    _norm_ref(ref, ref_wav)
 
     tts = get_tts()
     pad = AudioSegment.silent(ADD_SIL_MS)
     segs = []
-    # Speed tip: wrap inference for PyTorch
+
+    # Inference context (fast, and avoids autograd overhead)
     try:
         import torch
         inference_ctx = torch.inference_mode()
@@ -122,13 +125,9 @@ def main():
             tts.tts_to_file(text=chunk, speaker_wav=str(ref_wav), language=LANG, file_path=str(p))
             segs.append(AudioSegment.from_wav(p) + pad)
 
-    audio = AudioSegment.silent(150)  # tiny head
+    audio = AudioSegment.silent(150)  # small head
     for s in segs: audio += s
     audio.export(outp, format=(outp.suffix[1:] or "mp3"))
     print("✅ Done:", outp)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit as e:
-        print(e); sys.exit(1)
+# NOTE: Do NOT auto-run main() here; Streamlit will import this module.
